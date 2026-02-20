@@ -1,93 +1,142 @@
 import socket
 import time
+import sys
+import json
 
-IP = '0.0.0.0'
-PORT = 5555
-CHUNK = 1024
-TIMEOUT = 30  # Секунд бездействия до удаления клиента
+class VoiceServer:
+    def __init__(self, name="Default Server", ip='0.0.0.0', port=5555):
+        self.server_name = name
+        self.ip = ip
+        self.port = port
+        self.chunk = 1024
+        self.timeout = 30
+        
+        self.clients = []
+        self.message_history = [] # Массив словарей {"id": ..., "message": ...}
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-def start_server():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
-    try:
-        server_socket.bind((IP, PORT))
-    except Exception as e:
-        print(f"Ошибка запуска: {e}")
-        return
-
-    # Храним {адрес: время_последней_активности}
-    clients = {} 
-    print(f"Сервер VOICE-чат запущен на {PORT}...")
-
-    server_socket.settimeout(0.5)
-
-    while True:
+    def start(self):
         try:
+            self.server_socket.bind((self.ip, self.port))
+            self.server_socket.settimeout(0.5)
+            print("-" * 30)
+            print(f"СЕРВЕР: {self.server_name} ЗАПУЩЕН")
+            print("-" * 30)
+        except Exception as e:
+            print(f"Ошибка: {e}")
+            return
+
+        while True:
             try:
-                data, addr = server_socket.recvfrom(CHUNK * 8)
-            except socket.timeout:
-                data, addr = None, None
-
-            current_time = time.time()
-
-            if addr:
-                # 1. Регистрация НОВОГО пользователя
-                if addr not in clients:
-                    # Уведомляем существующих пользователей о новичке
-                    text_msg = f"\n[СЕРВЕР] Пользователь {addr} подключился к комнате!"
-                    msg = text_msg.encode('utf-8')
-                    for client_addr in list(clients.keys()):
-                        try:
-                            server_socket.sendto(msg, client_addr)
-                        except:
-                            pass
-                    
-                    print(f"Подключился: {addr} (Всего: {len(clients) + 1})")
-                
-                # Обновляем время активности
-                clients[addr] = current_time
-
-                # 2. Обработка выхода
-                if data == b"bye":
-                    if addr in clients:
-                        del clients[addr]
-                        # Уведомляем остальных об уходе
-                        text_exit = f"\n[СЕРВЕР] Пользователь {addr} покинул чат."
-                        msg = text_exit.encode('utf-8')
-                        for client_addr in list(clients.keys()):
-                            try:
-                                server_socket.sendto(msg, client_addr)
-                            except:
-                                pass
-                        print(f"Пользователь {addr} покинул чат.")
+                try:
+                    data, addr = self.server_socket.recvfrom(self.chunk * 8)
+                except socket.timeout:
+                    self._check_timeouts()
                     continue
 
-                # 3. Рассылка голоса
-                # Если данных много (звук), пересылаем. 
-                # Если мало, но это не "bye" и не "ping", возможно это текстовое уведомление
-                if len(data) > 20: 
-                    for client_addr in list(clients.keys()):
-                        if client_addr != addr:
-                            try:
-                                server_socket.sendto(data, client_addr)
-                            except Exception:
-                                if client_addr in clients:
-                                    del clients[client_addr]
-                                    print(f"Пользователь {client_addr} отключился (ошибка сети).")
+                if not data: continue
+                self._handle_packet(data, addr)
+                self._check_timeouts()
 
-            # 4. Проверка таймаутов
-            for client_addr, last_seen in list(clients.items()):
-                if current_time - last_seen > TIMEOUT:
-                    del clients[client_addr]
-                    print(f"Пользователь {client_addr} отключился по таймауту.")
+            except KeyboardInterrupt:
+                break
+        self.server_socket.close()
 
-        except KeyboardInterrupt:
-            print("\nСервер остановлен.")
-            break
-        except Exception as e:
-            print(f"Системная ошибка: {e}")
+    def _handle_packet(self, data, addr):
+        packet_type = data[0]
+        payload = data[1:]
+        client_id = str(addr)
 
-    server_socket.close()
+        client = next((c for c in self.clients if c["id"] == client_id), None)
+
+        # 0 - ПОДКЛЮЧЕНИЕ
+        if packet_type == 0:
+            if not client:
+                name = payload.decode('utf-8') if payload else "Anonymous"
+                new_client = {
+                    "id": client_id, "ip": addr[0], "port": addr[1],
+                    "name": name, "last_seen": time.time()
+                }
+                self.clients.append(new_client)
+                
+                # 1. Отправляем имя сервера
+                welcome = f"SERVER_NAME|{self.server_name}".encode('utf-8')
+                self.server_socket.sendto(bytes([0]) + welcome, addr)
+                
+                # 2. Отправляем историю сообщений (API тип 3)
+                self.send_history(addr)
+                
+                # 3. Рассылаем всем обновленный список участников (API тип 3)
+                self.broadcast_user_list()
+            else:
+                client["last_seen"] = time.time()
+
+        # 1 - ЗВУК (без изменений)
+        elif packet_type == 1:
+            if client:
+                client["last_seen"] = time.time()
+                for c in self.clients:
+                    if c["id"] != client_id:
+                        try: self.server_socket.sendto(data, (c["ip"], c["port"]))
+                        except: pass
+
+        # 2 - ТЕКСТ
+        elif packet_type == 2:
+            if client:
+                client["last_seen"] = time.time()
+                msg_text = payload.decode('utf-8')
+                
+                # Сохраняем в историю (для API)
+                history_entry = {"id": client["name"], "message": msg_text}
+                self.message_history.append(history_entry)
+                
+                # Рассылаем само сообщение (тип 2)
+                broadcast = f"{client['name']}: {msg_text}".encode('utf-8')
+                for c in self.clients:
+                    try: self.server_socket.sendto(bytes([2]) + broadcast, (c["ip"], c["port"]))
+                    except: pass
+
+    # --- API МЕТОДЫ ---
+
+    def broadcast_user_list(self):
+        """Отправляет всем клиентам список участников (Тип 3)"""
+        user_data = {
+            "action": "users",
+            "objects": [{"id": c["id"], "name": c["name"]} for c in self.clients]
+        }
+        self._send_api_json(user_data)
+
+    def send_history(self, addr):
+        """Отправляет конкретному клиенту историю сообщений (Тип 3)"""
+        history_data = {
+            "action": "messages",
+            "objects": self.message_history[-20:] # Последние 20 сообщений
+        }
+        self._send_api_json(history_data, addr)
+
+    def _send_api_json(self, data_dict, target_addr=None):
+        """Вспомогательный метод для упаковки JSON в пакет типа 3"""
+        json_payload = json.dumps(data_dict, ensure_ascii=False).encode('utf-8')
+        packet = bytes([3]) + json_payload
+        
+        if target_addr:
+            self.server_socket.sendto(packet, target_addr)
+        else:
+            # Рассылка всем
+            for c in self.clients:
+                try: self.server_socket.sendto(packet, (c["ip"], c["port"]))
+                except: pass
+
+    def _check_timeouts(self):
+        now = time.time()
+        initial_len = len(self.clients)
+        self.clients = [c for c in self.clients if now - c["last_seen"] < self.timeout]
+        
+        if len(self.clients) < initial_len:
+            print("[INFO] Клиент отключился по таймауту. Обновляю список...")
+            self.broadcast_user_list()
 
 if __name__ == "__main__":
-    start_server()
+    name = sys.argv[1] if len(sys.argv) > 1 else "Voce Chat"
+    server = VoiceServer(name=name)
+    server.start()
